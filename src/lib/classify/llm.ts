@@ -5,15 +5,17 @@ import type { ParsedGmailMessage } from "@/lib/gmail";
 import type { RuleClassification } from "@/lib/classify/rules";
 import { JOB_STATUSES, type JobStatus } from "@/lib/types";
 
-/** Keep prompts short + body capped to save free-tier tokens. */
-const BODY_EXCERPT_CHARS = 1200;
+/** Per-email body cap inside a batch (keep batches under TPM limits). */
+const BODY_EXCERPT_CHARS = 900;
 
 /**
- * Gemini free tier is often ~5–15 RPM. Space calls out and cap per sync.
- * Override with LLM_MIN_INTERVAL_MS / LLM_MAX_CALLS_PER_SYNC in .env
+ * Batch ~10 emails per API call to stretch free-tier RPM.
+ * Override with LLM_BATCH_SIZE / LLM_MIN_INTERVAL_MS / LLM_MAX_CALLS_PER_SYNC.
  */
+export const LLM_BATCH_SIZE = Number(process.env.LLM_BATCH_SIZE ?? 10);
 const MIN_INTERVAL_MS = Number(process.env.LLM_MIN_INTERVAL_MS ?? 4500);
-const MAX_CALLS_PER_SYNC = Number(process.env.LLM_MAX_CALLS_PER_SYNC ?? 12);
+/** Max API calls (batches) per sync — 5×10 emails ≈ 50 LLM-enriched messages. */
+const MAX_CALLS_PER_SYNC = Number(process.env.LLM_MAX_CALLS_PER_SYNC ?? 5);
 const MAX_RETRIES = 3;
 
 const ExtractionSchema = z.object({
@@ -24,6 +26,14 @@ const ExtractionSchema = z.object({
   appliedDate: z.string().nullable(),
   confidence: z.enum(["high", "medium", "low"]),
   reason: z.string(),
+});
+
+const BatchItemSchema = ExtractionSchema.extend({
+  id: z.string(),
+});
+
+const BatchResponseSchema = z.object({
+  results: z.array(BatchItemSchema),
 });
 
 export type ClassificationResult = {
@@ -37,10 +47,16 @@ export type ClassificationResult = {
   source: "rules" | "llm" | "hybrid";
 };
 
+export type LlmCandidate = {
+  message: ParsedGmailMessage;
+  rules: RuleClassification;
+};
+
 export type LlmSyncStats = {
   calls: number;
   rateLimitedFallbacks: number;
   budgetExhaustedFallbacks: number;
+  batchSize: number;
 };
 
 let lastLlmCallAt = 0;
@@ -48,12 +64,10 @@ let llmCallsThisSync = 0;
 let rateLimitedFallbacks = 0;
 let budgetExhaustedFallbacks = 0;
 
-/** Call at the start of each mailbox sync. */
 export function resetLlmBudget() {
   llmCallsThisSync = 0;
   rateLimitedFallbacks = 0;
   budgetExhaustedFallbacks = 0;
-  // Don't reset lastLlmCallAt — still respect spacing across syncs in the same process
 }
 
 export function getLlmSyncStats(): LlmSyncStats {
@@ -61,10 +75,15 @@ export function getLlmSyncStats(): LlmSyncStats {
     calls: llmCallsThisSync,
     rateLimitedFallbacks,
     budgetExhaustedFallbacks,
+    batchSize: LLM_BATCH_SIZE,
   };
 }
 
-const SYSTEM_PROMPT = `Classify one inbox email for a personal job APPLICATION tracker. Reply with JSON only.
+const BATCH_SYSTEM_PROMPT = `You classify inbox emails for a personal job APPLICATION tracker.
+You will receive a JSON array of emails. Reply with JSON only:
+{ "results": [ { "id": "<same id>", "isJobRelated": bool, "company": string|null, "role": string|null, "status": "...", "appliedDate": string|null, "confidence": "high|medium|low", "reason": "..." } ] }
+
+Return exactly one result object per input email, using the same id.
 
 isJobRelated=true only if the recipient already applied, or this is a later stage update (review/assessment invite/scheduled interview/offer/rejection/withdrawal).
 isJobRelated=false for alerts, digests, new openings, apply-bots, cold outreach, newsletters.
@@ -76,9 +95,8 @@ status:
 - interview: ONLY invited/scheduled/confirmed interview — not the word "interview" alone
 - offer|rejected|withdrawn|unknown
 
-Extract company (never "Unknown"; null if unclear), role/title (null if absent), appliedDate ISO or null, confidence, short reason.
-
-Keys: isJobRelated, company, role, status, appliedDate, confidence, reason`;
+company: never "Unknown"; null if unclear. role: job title or null.
+status must be one of: ${JOB_STATUSES.join("|")}`;
 
 function parseAppliedDate(value: string | null): Date | null {
   if (!value) return null;
@@ -87,7 +105,7 @@ function parseAppliedDate(value: string | null): Date | null {
   return d;
 }
 
-function fromRules(
+export function fromRules(
   message: ParsedGmailMessage,
   rules: RuleClassification,
   extraReason?: string
@@ -143,18 +161,21 @@ function stripJsonFence(text: string): string {
   return fenced?.[1]?.trim() ?? trimmed;
 }
 
-function buildUserPayload(message: ParsedGmailMessage, rules: RuleClassification) {
+function buildBatchPayload(candidates: LlmCandidate[]) {
   return JSON.stringify({
-    from: message.fromAddress,
-    subject: message.subject,
-    date: message.receivedAt.toISOString(),
-    snippet: message.snippet?.slice(0, 280) ?? "",
-    bodyExcerpt: message.bodyExcerpt.slice(0, BODY_EXCERPT_CHARS),
-    rulesHint: {
-      status: rules.status,
-      companyGuess: rules.companyGuess,
-      roleGuess: rules.roleGuess,
-    },
+    emails: candidates.map(({ message, rules }) => ({
+      id: message.gmailMessageId,
+      from: message.fromAddress,
+      subject: message.subject,
+      date: message.receivedAt.toISOString(),
+      snippet: message.snippet?.slice(0, 200) ?? "",
+      bodyExcerpt: message.bodyExcerpt.slice(0, BODY_EXCERPT_CHARS),
+      rulesHint: {
+        status: rules.status,
+        companyGuess: rules.companyGuess,
+        roleGuess: rules.roleGuess,
+      },
+    })),
   });
 }
 
@@ -189,8 +210,9 @@ function resolveProvider(): "gemini" | "openai" | null {
   return null;
 }
 
-function shouldCallLlm(rules: RuleClassification): boolean {
+export function needsLlm(rules: RuleClassification): boolean {
   if (rules.noiseKind !== "none") return false;
+  if (!resolveProvider()) return false;
   return rules.isLikelyJob;
 }
 
@@ -225,7 +247,6 @@ async function withRetries<T>(fn: () => Promise<T>): Promise<T> {
     } catch (err) {
       lastErr = err;
       if (!isRateLimitError(err) || attempt === MAX_RETRIES - 1) throw err;
-      // Free tier: back off hard (15s, 30s, …)
       const backoff = 15000 * (attempt + 1);
       console.warn(`LLM rate limited; retrying in ${backoff}ms`);
       await sleep(backoff);
@@ -235,92 +256,124 @@ async function withRetries<T>(fn: () => Promise<T>): Promise<T> {
   throw lastErr;
 }
 
-async function classifyWithGemini(
-  message: ParsedGmailMessage,
-  rules: RuleClassification
+async function generateBatchRaw(
+  provider: "gemini" | "openai",
+  candidates: LlmCandidate[]
 ): Promise<string> {
-  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-  const modelName = process.env.GEMINI_MODEL?.trim() || "gemini-2.0-flash";
-  const model = genAI.getGenerativeModel({
-    model: modelName,
-    generationConfig: {
-      temperature: 0,
-      responseMimeType: "application/json",
-      maxOutputTokens: 256,
-    },
-  });
+  const userContent = buildBatchPayload(candidates);
+  // ~80 tokens per result item
+  const maxOut = Math.min(2048, 120 + candidates.length * 100);
 
-  const result = await model.generateContent([
-    { text: SYSTEM_PROMPT },
-    { text: buildUserPayload(message, rules) },
-  ]);
+  if (provider === "gemini") {
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+    const modelName = process.env.GEMINI_MODEL?.trim() || "gemini-2.0-flash";
+    const model = genAI.getGenerativeModel({
+      model: modelName,
+      generationConfig: {
+        temperature: 0,
+        responseMimeType: "application/json",
+        maxOutputTokens: maxOut,
+      },
+    });
+    const result = await model.generateContent([
+      { text: BATCH_SYSTEM_PROMPT },
+      { text: userContent },
+    ]);
+    return result.response.text();
+  }
 
-  return result.response.text();
-}
-
-async function classifyWithOpenAI(
-  message: ParsedGmailMessage,
-  rules: RuleClassification
-): Promise<string> {
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
   const completion = await openai.chat.completions.create({
     model: process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini",
     temperature: 0,
-    max_tokens: 256,
+    max_tokens: maxOut,
     response_format: { type: "json_object" },
     messages: [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: buildUserPayload(message, rules) },
+      { role: "system", content: BATCH_SYSTEM_PROMPT },
+      { role: "user", content: userContent },
     ],
   });
   return completion.choices[0]?.message?.content ?? "{}";
 }
 
+function parseBatchResponse(
+  rawText: string,
+  candidates: LlmCandidate[],
+  provider: string
+): ClassificationResult[] {
+  const parsed = BatchResponseSchema.safeParse(
+    JSON.parse(stripJsonFence(rawText))
+  );
+
+  const byId = new Map<string, z.infer<typeof BatchItemSchema>>();
+  if (parsed.success) {
+    for (const item of parsed.data.results) {
+      byId.set(item.id, item);
+    }
+  }
+
+  return candidates.map(({ message, rules }) => {
+    const item = byId.get(message.gmailMessageId);
+    if (!item) {
+      return fromRules(message, rules, `${provider}-batch-missing-id`);
+    }
+    const haystack = `${message.subject}\n${message.snippet}\n${message.bodyExcerpt}`;
+    return toResult(item, message, rules, haystack);
+  });
+}
+
+/**
+ * Classify a batch of rule-matched emails in a single LLM API call.
+ * Falls back to rules for the whole batch on budget/rate-limit/parse failure.
+ */
+export async function classifyEmailBatch(
+  candidates: LlmCandidate[]
+): Promise<ClassificationResult[]> {
+  if (candidates.length === 0) return [];
+
+  const provider = resolveProvider();
+  if (!provider) {
+    return candidates.map(({ message, rules }) => fromRules(message, rules));
+  }
+
+  if (llmCallsThisSync >= MAX_CALLS_PER_SYNC) {
+    budgetExhaustedFallbacks += candidates.length;
+    return candidates.map(({ message, rules }) =>
+      fromRules(message, rules, "llm-budget-exhausted")
+    );
+  }
+
+  try {
+    llmCallsThisSync += 1;
+    const rawText = await withRetries(() =>
+      generateBatchRaw(provider, candidates)
+    );
+    return parseBatchResponse(rawText, candidates, provider);
+  } catch (err) {
+    console.error(`${provider} batch classification failed`, err);
+    if (isRateLimitError(err)) {
+      rateLimitedFallbacks += 1;
+      llmCallsThisSync = MAX_CALLS_PER_SYNC;
+      return candidates.map(({ message, rules }) =>
+        fromRules(message, rules, `${provider}-rate-limited`)
+      );
+    }
+    return candidates.map(({ message, rules }) =>
+      fromRules(message, rules, `${provider}-batch-error`)
+    );
+  }
+}
+
+/** Convenience for a single email (wraps batch of 1). */
 export async function classifyEmail(
   message: ParsedGmailMessage,
   rules: RuleClassification
 ): Promise<ClassificationResult> {
-  if (!shouldCallLlm(rules)) {
+  if (!needsLlm(rules)) {
     return fromRules(message, rules);
   }
-
-  const provider = resolveProvider();
-  if (!provider) {
-    return fromRules(message, rules);
-  }
-
-  if (llmCallsThisSync >= MAX_CALLS_PER_SYNC) {
-    budgetExhaustedFallbacks += 1;
-    return fromRules(message, rules, "llm-budget-exhausted");
-  }
-
-  const haystack = `${message.subject}\n${message.snippet}\n${message.bodyExcerpt}`;
-
-  try {
-    llmCallsThisSync += 1;
-    const rawText = await withRetries(async () =>
-      provider === "gemini"
-        ? classifyWithGemini(message, rules)
-        : classifyWithOpenAI(message, rules)
-    );
-
-    const parsed = ExtractionSchema.safeParse(
-      JSON.parse(stripJsonFence(rawText))
-    );
-    if (!parsed.success) {
-      return fromRules(message, rules, `${provider}-parse-failed`);
-    }
-    return toResult(parsed.data, message, rules, haystack);
-  } catch (err) {
-    console.error(`${provider} classification failed`, err);
-    if (isRateLimitError(err)) {
-      rateLimitedFallbacks += 1;
-      // Stop burning the free tier for the rest of this sync
-      llmCallsThisSync = MAX_CALLS_PER_SYNC;
-      return fromRules(message, rules, `${provider}-rate-limited`);
-    }
-    return fromRules(message, rules, `${provider}-error`);
-  }
+  const [result] = await classifyEmailBatch([{ message, rules }]);
+  return result;
 }
 
 export function getActiveLlmProvider(): "gemini" | "openai" | "none" {

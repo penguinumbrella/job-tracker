@@ -19,7 +19,7 @@ export async function GET() {
       provider === "none"
         ? "Add GEMINI_API_KEY to .env for free-tier classification (Google AI Studio)."
         : provider === "gemini"
-          ? "Using Gemini. Prefer Test sync (14d) while evaluating free quota."
-          : "Using OpenAI. Prefer Test sync (14d) while evaluating spend.",
+          ? "Using Gemini in batches of ~10 emails/request. Prefer Test sync (14d) on free tier."
+          : "Using OpenAI in batches of ~10. Prefer Test sync (14d) while evaluating spend.",
   });
 }

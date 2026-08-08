@@ -5,12 +5,21 @@ import {
   listCandidateMessageIds,
   listHistoryMessageIds,
   startGmailWatch,
+  type ParsedGmailMessage,
 } from "@/lib/gmail";
-import { classifyWithRules } from "@/lib/classify/rules";
 import {
-  classifyEmail,
+  classifyWithRules,
+  type RuleClassification,
+} from "@/lib/classify/rules";
+import {
+  classifyEmailBatch,
+  fromRules,
   getLlmSyncStats,
+  LLM_BATCH_SIZE,
+  needsLlm,
   resetLlmBudget,
+  type ClassificationResult,
+  type LlmCandidate,
 } from "@/lib/classify/llm";
 import {
   findMatchingApplication,
@@ -32,6 +41,7 @@ export type SyncSummary = {
   llmCalls?: number;
   llmRateLimitedFallbacks?: number;
   llmBudgetExhaustedFallbacks?: number;
+  llmBatchSize?: number;
 };
 
 function formatGoogleApiError(err: unknown): string {
@@ -41,32 +51,30 @@ function formatGoogleApiError(err: unknown): string {
   return String(err);
 }
 
-async function processMessage(
+function attachLlmStats(summary: SyncSummary) {
+  const llm = getLlmSyncStats();
+  summary.llmCalls = llm.calls;
+  summary.llmRateLimitedFallbacks = llm.rateLimitedFallbacks;
+  summary.llmBudgetExhaustedFallbacks = llm.budgetExhaustedFallbacks;
+  summary.llmBatchSize = llm.batchSize;
+  if (llm.rateLimitedFallbacks > 0) {
+    summary.errors.push(
+      `Gemini rate-limited ${llm.rateLimitedFallbacks} time(s); fell back to rules for the rest of this sync`
+    );
+  }
+  if (llm.budgetExhaustedFallbacks > 0) {
+    summary.errors.push(
+      `LLM budget reached; ${llm.budgetExhaustedFallbacks} email(s) used rules only (batch size ${llm.batchSize}, max ${process.env.LLM_MAX_CALLS_PER_SYNC ?? 5} API calls/sync)`
+    );
+  }
+}
+
+async function persistClassification(
   userId: string,
-  messageId: string,
+  message: ParsedGmailMessage,
+  classification: ClassificationResult,
   summary: SyncSummary
 ) {
-  const existing = await prisma.emailEvent.findUnique({
-    where: {
-      userId_gmailMessageId: { userId, gmailMessageId: messageId },
-    },
-  });
-  if (existing) {
-    summary.skipped += 1;
-    return;
-  }
-
-  const message = await fetchParsedMessage(userId, messageId);
-  if (!message) {
-    summary.skipped += 1;
-    return;
-  }
-
-  summary.scanned += 1;
-
-  const rules = classifyWithRules(message);
-  const classification = await classifyEmail(message, rules);
-
   if (!classification.isJobRelated) {
     await prisma.emailEvent.create({
       data: {
@@ -89,7 +97,6 @@ async function processMessage(
     return;
   }
 
-  // Need a real company name — never create "Unknown company" rows from weak mail
   const company = classification.company?.trim();
   if (!company) {
     await prisma.emailEvent.create({
@@ -113,11 +120,10 @@ async function processMessage(
     return;
   }
 
-  let application = await findMatchingApplication(
-    userId,
-    message,
-    { ...classification, company }
-  );
+  let application = await findMatchingApplication(userId, message, {
+    ...classification,
+    company,
+  });
 
   if (!application) {
     application = await prisma.application.create({
@@ -142,7 +148,6 @@ async function processMessage(
     if (!application.appliedAt && classification.appliedAt) {
       data.appliedAt = classification.appliedAt;
     }
-    // Upgrade placeholder-ish company names when we extract a better one
     if (
       company &&
       (/^unknown/i.test(application.company) || application.company.length < 2)
@@ -187,12 +192,63 @@ async function processMessage(
   }
 }
 
+async function flushLlmBatch(
+  userId: string,
+  batch: LlmCandidate[],
+  summary: SyncSummary
+) {
+  if (batch.length === 0) return;
+  const results = await classifyEmailBatch(batch);
+  for (let i = 0; i < batch.length; i++) {
+    await persistClassification(userId, batch[i].message, results[i], summary);
+  }
+}
+
+/**
+ * Load a message, run rules, and either queue for LLM batch or persist immediately.
+ */
+async function ingestMessageId(
+  userId: string,
+  messageId: string,
+  summary: SyncSummary,
+  llmQueue: LlmCandidate[]
+) {
+  const existing = await prisma.emailEvent.findUnique({
+    where: {
+      userId_gmailMessageId: { userId, gmailMessageId: messageId },
+    },
+  });
+  if (existing) {
+    summary.skipped += 1;
+    return;
+  }
+
+  const message = await fetchParsedMessage(userId, messageId);
+  if (!message) {
+    summary.skipped += 1;
+    return;
+  }
+
+  summary.scanned += 1;
+  const rules: RuleClassification = classifyWithRules(message);
+
+  if (needsLlm(rules)) {
+    llmQueue.push({ message, rules });
+    if (llmQueue.length >= LLM_BATCH_SIZE) {
+      const batch = llmQueue.splice(0, LLM_BATCH_SIZE);
+      await flushLlmBatch(userId, batch, summary);
+    }
+    return;
+  }
+
+  await persistClassification(userId, message, fromRules(message, rules), summary);
+}
+
 export async function syncUserMailbox(
   userId: string,
   options: {
     newerThanDays?: number;
     maxPages?: number;
-    /** Delete previously rejected/non-job email rows so improved classifiers can reconsider them. */
     reclassifySkipped?: boolean;
   } = {}
 ): Promise<SyncSummary> {
@@ -206,6 +262,7 @@ export async function syncUserMailbox(
   };
 
   resetLlmBudget();
+  const llmQueue: LlmCandidate[] = [];
 
   if (options.reclassifySkipped) {
     const deleted = await prisma.emailEvent.deleteMany({
@@ -239,7 +296,7 @@ export async function syncUserMailbox(
 
       for (const id of page.ids) {
         try {
-          await processMessage(userId, id, summary);
+          await ingestMessageId(userId, id, summary, llmQueue);
         } catch (err) {
           summary.errors.push(`Message ${id}: ${formatGoogleApiError(err)}`);
         }
@@ -248,6 +305,9 @@ export async function syncUserMailbox(
       pageToken = page.nextPageToken;
       pages += 1;
     } while (pageToken && pages < maxPages);
+
+    // Flush remaining partial batch
+    await flushLlmBatch(userId, llmQueue.splice(0, llmQueue.length), summary);
   } catch (err) {
     summary.errors.push(`Gmail list failed: ${formatGoogleApiError(err)}`);
     throw Object.assign(new Error(formatGoogleApiError(err)), { summary });
@@ -268,21 +328,7 @@ export async function syncUserMailbox(
     );
   }
 
-  const llm = getLlmSyncStats();
-  summary.llmCalls = llm.calls;
-  summary.llmRateLimitedFallbacks = llm.rateLimitedFallbacks;
-  summary.llmBudgetExhaustedFallbacks = llm.budgetExhaustedFallbacks;
-  if (llm.rateLimitedFallbacks > 0) {
-    summary.errors.push(
-      `Gemini rate-limited ${llm.rateLimitedFallbacks} time(s); fell back to rules for the rest of this sync`
-    );
-  }
-  if (llm.budgetExhaustedFallbacks > 0) {
-    summary.errors.push(
-      `LLM budget (${process.env.LLM_MAX_CALLS_PER_SYNC ?? 12}/sync) reached; ${llm.budgetExhaustedFallbacks} email(s) used rules only`
-    );
-  }
-
+  attachLlmStats(summary);
   return summary;
 }
 
@@ -304,6 +350,7 @@ export async function syncFromHistory(userId: string): Promise<SyncSummary> {
   };
 
   resetLlmBudget();
+  const llmQueue: LlmCandidate[] = [];
 
   const { messageIds, newHistoryId } = await listHistoryMessageIds(
     userId,
@@ -316,11 +363,12 @@ export async function syncFromHistory(userId: string): Promise<SyncSummary> {
 
   for (const id of messageIds) {
     try {
-      await processMessage(userId, id, summary);
+      await ingestMessageId(userId, id, summary, llmQueue);
     } catch (err) {
       summary.errors.push(`Message ${id}: ${formatGoogleApiError(err)}`);
     }
   }
+  await flushLlmBatch(userId, llmQueue.splice(0, llmQueue.length), summary);
 
   const historyId = newHistoryId ?? (await getProfileHistoryId(userId));
   await prisma.user.update({
@@ -331,11 +379,7 @@ export async function syncFromHistory(userId: string): Promise<SyncSummary> {
     },
   });
 
-  const llm = getLlmSyncStats();
-  summary.llmCalls = llm.calls;
-  summary.llmRateLimitedFallbacks = llm.rateLimitedFallbacks;
-  summary.llmBudgetExhaustedFallbacks = llm.budgetExhaustedFallbacks;
-
+  attachLlmStats(summary);
   return summary;
 }
 
