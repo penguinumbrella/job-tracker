@@ -7,7 +7,7 @@ function msg(partial: Partial<ParsedGmailMessage>): ParsedGmailMessage {
     gmailMessageId: "x",
     gmailThreadId: "t",
     receivedAt: new Date("2026-03-01"),
-    fromAddress: 'Careers <noreply@example.com>',
+    fromAddress: "Careers <noreply@example.com>",
     subject: "Hello",
     snippet: "",
     bodyExcerpt: "",
@@ -16,19 +16,48 @@ function msg(partial: Partial<ParsedGmailMessage>): ParsedGmailMessage {
   };
 }
 
-// Real application confirmation → keep + extract company from body
+// Real application confirmation → company + role + applied (not interview)
 {
   const r = classifyWithRules(
     msg({
       fromAddress: "JPMorgan Chase Recruiting <no-reply@jpmorganchase.com>",
       subject: "Thank you for applying",
       bodyExcerpt:
-        "Congrats! We have received your application at JPMorgan Chase for the Software Engineer Intern role.",
+        "Congrats! We have received your application at JPMorgan Chase for the Software Engineer Intern role. If you are selected for an interview, we will be in touch.",
     })
   );
   assert.equal(r.isLikelyJob, true);
   assert.equal(r.status, "applied");
   assert.match(r.companyGuess ?? "", /JPMorgan/i);
+  assert.match(r.roleGuess ?? "", /Software Engineer Intern/i);
+}
+
+// Hypothetical interview language must not become interview status
+{
+  const r = classifyWithRules(
+    msg({
+      subject: "Application received — next steps",
+      bodyExcerpt:
+        "Thank you for your application. Our interview process includes several rounds. We will contact you if selected for an interview.",
+    })
+  );
+  assert.equal(r.isLikelyJob, true);
+  assert.equal(r.status, "applied");
+}
+
+// Real interview invite
+{
+  const r = classifyWithRules(
+    msg({
+      subject: "Interview invitation — Acme Corp",
+      bodyExcerpt:
+        "You are invited to schedule an interview with Acme for the Backend Engineer role.",
+      fromAddress: "Acme Recruiting <talent@acme.com>",
+    })
+  );
+  assert.equal(r.isLikelyJob, true);
+  assert.equal(r.status, "interview");
+  assert.match(r.roleGuess ?? "", /Backend Engineer/i);
 }
 
 // Job alert / new opening → reject

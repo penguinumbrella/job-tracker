@@ -11,6 +11,7 @@ export async function POST(request: Request) {
   const body = (await request.json().catch(() => ({}))) as {
     mode?: "full" | "incremental";
     newerThanDays?: number;
+    reclassifySkipped?: boolean;
   };
 
   try {
@@ -19,6 +20,8 @@ export async function POST(request: Request) {
         ? await syncFromHistory(session.user.id)
         : await syncUserMailbox(session.user.id, {
             newerThanDays: body.newerThanDays ?? 90,
+            // Full sync reconsiders emails we previously marked as noise
+            reclassifySkipped: body.reclassifySkipped ?? true,
           });
     return NextResponse.json(summary);
   } catch (err) {

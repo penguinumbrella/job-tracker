@@ -49,23 +49,56 @@ function fromRules(
   };
 }
 
+/** Guardrail: LLMs often mark "thank you for applying… interview process" as interview. */
+function reconcileStatus(
+  llmStatus: JobStatus,
+  rules: RuleClassification,
+  haystack: string
+): JobStatus {
+  const hypotheticalInterview =
+    /\b(if (you are )?selected for (an )?interview|may (include|involve) (an )?interview|interview process|we will (be in touch|contact you).{0,40}interview)\b/i.test(
+      haystack
+    );
+  const realInterview =
+    /\b(you('?re| are) invited to|invitation to|please (schedule|book)|scheduled|confirmed).{0,50}\b(interview|phone screen|onsite)\b/i.test(
+      haystack
+    );
+
+  if (llmStatus === "interview" && hypotheticalInterview && !realInterview) {
+    if (rules.status === "applied" || rules.status === "under_review") {
+      return rules.status;
+    }
+    return "applied";
+  }
+
+  // Prefer strong rules evidence for applied confirmations
+  if (
+    rules.status === "applied" &&
+    rules.confidence !== "low" &&
+    llmStatus === "interview" &&
+    !realInterview
+  ) {
+    return "applied";
+  }
+
+  return llmStatus;
+}
+
 export async function classifyEmail(
   message: ParsedGmailMessage,
   rules: RuleClassification
 ): Promise<ClassificationResult> {
-  // Hard-reject alerts / bots without spending LLM tokens
   if (rules.noiseKind !== "none") {
     return fromRules(message, rules);
   }
 
   const apiKey = process.env.OPENAI_API_KEY;
+  const haystack = `${message.subject}\n${message.snippet}\n${message.bodyExcerpt}`;
 
-  // No LLM: only keep emails with strong application evidence from rules
   if (!apiKey) {
     return fromRules(message, rules);
   }
 
-  // Skip LLM when rules already know it's noise or clearly not an application
   if (!rules.isLikelyJob && rules.confidence === "high") {
     return fromRules(message, rules);
   }
@@ -81,23 +114,26 @@ export async function classifyEmail(
           role: "system",
           content: `You classify inbox emails for a personal job APPLICATION tracker.
 
-isJobRelated must be TRUE only when the email is about an application the recipient already submitted, or a later hiring-stage update for that application (review, assessment, interview, offer, rejection, withdrawal).
+isJobRelated = true ONLY if the email is about an application the recipient already submitted, OR a later stage update for that same application (review, assessment invite, scheduled interview, offer, rejection, withdrawal).
 
-isJobRelated must be FALSE for:
-- Job alerts / digests / "new positions hiring" / recommended jobs
-- "Apply now" marketing or application bots / reminders to finish applying
-- Recruiter cold outreach that does not reference an existing application
-- Newsletters, networking, events
+isJobRelated = false for job alerts, digests, "new openings", apply-now bots, cold recruiter spam, newsletters.
 
-When isJobRelated is true, extract:
-- company: the employer name. Prefer phrases in the body like "we received your application at/to/for/with COMPANY", "thank you for applying to COMPANY". Fall back to a clear display name in From. Never invent "Unknown". Use null if truly unclear.
-- role: job title if present, else null
-- status: one of ${JOB_STATUSES.join("|")}
-- appliedDate: ISO date if the email confirms submission, else null
+STATUS RULES (important):
+- applied: confirmation that they submitted / application was received. Even if the email mentions "interview process" or "if selected for an interview", status is still applied.
+- under_review: explicitly reviewing their application now.
+- assessment: they are asked to complete a test / Hackerrank / take-home NOW.
+- interview: ONLY if an interview is invited, scheduled, or confirmed. Mere mention of the word "interview" is NOT enough.
+- offer / rejected / withdrawn: clear outcome language.
+- unknown: unclear stage.
+
+FIELD EXTRACTION:
+- company: employer name from body ("application at/to/with COMPANY") or From display name. Never "Unknown"; use null if unclear.
+- role: the job title (e.g. "Software Engineer Intern", "Analyst"). Look in subject and body for "application for ROLE", "ROLE role/position", "Position: ROLE". null if absent.
+- appliedDate: ISO date when this email confirms submission; else null.
 - confidence: high|medium|low
-- reason: short explanation
+- reason: short
 
-Return JSON only with keys: isJobRelated, company, role, status, appliedDate, confidence, reason.`,
+Return JSON keys: isJobRelated, company, role, status, appliedDate, confidence, reason.`,
         },
         {
           role: "user",
@@ -106,7 +142,7 @@ Return JSON only with keys: isJobRelated, company, role, status, appliedDate, co
             subject: message.subject,
             date: message.receivedAt.toISOString(),
             snippet: message.snippet,
-            bodyExcerpt: message.bodyExcerpt.slice(0, 2200),
+            bodyExcerpt: message.bodyExcerpt.slice(0, 3500),
             rulesHint: {
               isLikelyJob: rules.isLikelyJob,
               status: rules.status,
@@ -130,16 +166,18 @@ Return JSON only with keys: isJobRelated, company, role, status, appliedDate, co
       (data.company && data.company.trim()) ||
       rules.companyGuess ||
       null;
-    const role = (data.role && data.role.trim()) || rules.roleGuess || null;
+    const role =
+      (data.role && data.role.trim()) || rules.roleGuess || null;
+    const status = reconcileStatus(data.status, rules, haystack);
 
     return {
       isJobRelated: data.isJobRelated,
       company: company && !/^unknown$/i.test(company) ? company : null,
       role,
-      status: data.status,
+      status,
       appliedAt:
         parseAppliedDate(data.appliedDate) ??
-        (data.status === "applied" ? message.receivedAt : null),
+        (status === "applied" ? message.receivedAt : null),
       confidence: data.confidence,
       reason: data.reason,
       source: "hybrid",

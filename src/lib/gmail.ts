@@ -101,10 +101,10 @@ export function parseGmailMessage(
 export const JOB_MAIL_QUERY =
   "(" +
   [
-    'subject:("thank you for applying" OR "application received" OR "we received your application" OR "application submitted" OR "your application" OR interview OR assessment OR "under review" OR "unfortunately" OR "offer")',
-    "from:(greenhouse.io OR lever.co OR myworkday.com OR ashbyhq.com OR workable.com OR icims.com OR successfactors.com OR smartrecruiters.com OR jobvite.com OR taleo.net OR brassring.com)",
+    'subject:("thank you for applying" OR "thanks for applying" OR "application received" OR "we received your application" OR "application submitted" OR "your application" OR "application confirmation" OR "successfully submitted" OR "successfully applied" OR assessment OR "under review" OR unfortunately OR "offer letter" OR "interview invitation" OR "interview scheduled" OR "phone screen")',
+    "from:(greenhouse.io OR lever.co OR myworkday.com OR ashbyhq.com OR workable.com OR icims.com OR successfactors.com OR smartrecruiters.com OR jobvite.com OR taleo.net OR brassring.com OR ultipro.com OR dayforcehcm.com)",
   ].join(" OR ") +
-  ') -category:promotions -unsubscribe -("job alert" OR "jobs for you" OR "new openings" OR "recommended jobs" OR "jobs matching")';
+  ') -category:promotions -("job alert" OR "jobs for you" OR "new openings" OR "recommended jobs" OR "jobs matching" OR "jobs you may like")';
 
 export async function listCandidateMessageIds(
   userId: string,

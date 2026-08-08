@@ -182,7 +182,12 @@ async function processMessage(
 
 export async function syncUserMailbox(
   userId: string,
-  options: { newerThanDays?: number; maxPages?: number } = {}
+  options: {
+    newerThanDays?: number;
+    maxPages?: number;
+    /** Delete previously rejected/non-job email rows so improved classifiers can reconsider them. */
+    reclassifySkipped?: boolean;
+  } = {}
 ): Promise<SyncSummary> {
   const summary: SyncSummary = {
     scanned: 0,
@@ -193,6 +198,17 @@ export async function syncUserMailbox(
     errors: [],
   };
 
+  if (options.reclassifySkipped) {
+    const deleted = await prisma.emailEvent.deleteMany({
+      where: { userId, isJobRelated: false },
+    });
+    if (deleted.count > 0) {
+      summary.errors.push(
+        `Reclassify: cleared ${deleted.count} previously skipped email(s) for a fresh look`
+      );
+    }
+  }
+
   try {
     const sheetId = await ensureUserSpreadsheet(userId);
     summary.sheetUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/edit`;
@@ -200,7 +216,7 @@ export async function syncUserMailbox(
     summary.errors.push(`Could not create/open Sheet: ${formatGoogleApiError(err)}`);
   }
 
-  const maxPages = options.maxPages ?? 5;
+  const maxPages = options.maxPages ?? 12;
   let pageToken: string | undefined;
   let pages = 0;
 
@@ -208,7 +224,7 @@ export async function syncUserMailbox(
     do {
       const page = await listCandidateMessageIds(userId, {
         newerThanDays: options.newerThanDays ?? 90,
-        maxResults: 40,
+        maxResults: 50,
         pageToken,
       });
 
