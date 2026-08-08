@@ -117,6 +117,42 @@ export function DashboardClient({
     });
   }
 
+  function clearAndResync() {
+    const ok = window.confirm(
+      "Clear all synced emails and applications, then run Test sync (14 days)?\n\nThis lets Gemini reclassify from scratch. Your Google Sheet may still have old rows."
+    );
+    if (!ok) return;
+
+    setSyncMessage(null);
+    setError(null);
+    startTransition(async () => {
+      try {
+        const res = await fetch("/api/sync/reset", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            clearApplications: true,
+            resync: true,
+            newerThanDays: 14,
+            maxPages: 2,
+          }),
+        });
+        const json = await res.json();
+        if (!res.ok) throw new Error(json.error ?? "Reset failed");
+        const s = json.summary;
+        setSyncMessage(
+          `Cleared ${json.deletedEvents} email(s) + ${json.deletedApplications} app(s). ` +
+            (s
+              ? `Resync [${json.mode}/${json.llmProvider}]: scanned ${s.scanned}, created ${s.createdApplications}, updated ${s.updatedApplications}, skipped ${s.skipped}`
+              : "No resync.")
+        );
+        await load();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    });
+  }
+
   async function updateApplication(id: string, patch: Record<string, unknown>) {
     const res = await fetch(`/api/applications/${id}`, {
       method: "PATCH",
@@ -202,6 +238,14 @@ export function DashboardClient({
             className="rounded-md border border-stone-300 bg-white px-3 py-2 text-sm text-stone-800 hover:bg-stone-50 disabled:opacity-50"
           >
             Full sync (90 days)
+          </button>
+          <button
+            type="button"
+            disabled={isPending}
+            onClick={clearAndResync}
+            className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-900 hover:bg-rose-100 disabled:opacity-50"
+          >
+            Clear emails & resync
           </button>
           <button
             type="button"
