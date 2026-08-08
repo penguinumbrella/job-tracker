@@ -19,13 +19,22 @@ export async function GET() {
           take: 5,
         },
       },
-      orderBy: [{ updatedAt: "desc" }],
+      // appliedAt desc first; createdAt as tiebreaker (SQLite puts nulls first — we re-sort below)
+      orderBy: [{ appliedAt: "desc" }, { createdAt: "desc" }],
     }),
     prisma.user.findUnique({ where: { id: session.user.id } }),
   ]);
 
+  // Newest applications first; rows without appliedAt sink to the bottom
+  const sorted = [...applications].sort((a, b) => {
+    const aTime = a.appliedAt?.getTime() ?? 0;
+    const bTime = b.appliedAt?.getTime() ?? 0;
+    if (aTime !== bTime) return bTime - aTime;
+    return b.createdAt.getTime() - a.createdAt.getTime();
+  });
+
   return NextResponse.json({
-    applications,
+    applications: sorted,
     lastSyncedAt: user?.lastSyncedAt ?? null,
     sheetUrl: user?.sheetId ? spreadsheetUrl(user.sheetId) : null,
     gmailWatchExpiry: user?.gmailWatchExpiry ?? null,

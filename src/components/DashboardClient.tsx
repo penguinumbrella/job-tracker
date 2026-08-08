@@ -69,6 +69,7 @@ export function DashboardClient({
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<"all" | JobStatus>("all");
 
   const load = useCallback(async () => {
     const res = await fetch("/api/applications");
@@ -117,6 +118,21 @@ export function DashboardClient({
     }
     await load();
   }
+
+  const filteredApplications =
+    data?.applications.filter((app) => {
+      if (statusFilter === "all") return true;
+      return displayStatus(app) === statusFilter;
+    }) ?? [];
+
+  const statusCounts = (data?.applications ?? []).reduce(
+    (acc, app) => {
+      const s = displayStatus(app);
+      acc[s] = (acc[s] ?? 0) + 1;
+      return acc;
+    },
+    {} as Record<string, number>
+  );
 
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-4 py-8 sm:px-6">
@@ -205,6 +221,38 @@ export function DashboardClient({
           </button>
         </div>
       ) : (
+        <div className="flex flex-col gap-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <label className="flex items-center gap-2 text-sm text-stone-600">
+              Status
+              <select
+                className="rounded-md border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900"
+                value={statusFilter}
+                onChange={(e) =>
+                  setStatusFilter(e.target.value as "all" | JobStatus)
+                }
+              >
+                <option value="all">
+                  All statuses ({data.applications.length})
+                </option>
+                {JOB_STATUSES.map((s) => (
+                  <option key={s} value={s}>
+                    {STATUS_LABELS[s]}
+                    {statusCounts[s] ? ` (${statusCounts[s]})` : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <p className="text-xs text-stone-500">
+              Sorted by applied date (newest first)
+            </p>
+          </div>
+
+          {filteredApplications.length === 0 ? (
+            <div className="rounded-lg border border-dashed border-stone-300 bg-white/70 px-6 py-12 text-center text-stone-600">
+              No applications with this status.
+            </div>
+          ) : (
         <div className="overflow-x-auto rounded-lg border border-stone-200 bg-white shadow-sm">
           <table className="min-w-full text-left text-sm">
             <thead className="border-b border-stone-200 bg-stone-50 text-xs uppercase tracking-wide text-stone-500">
@@ -218,7 +266,7 @@ export function DashboardClient({
               </tr>
             </thead>
             <tbody>
-              {data.applications.map((app) => {
+              {filteredApplications.map((app) => {
                 const status = displayStatus(app);
                 const latest = app.emails[0];
                 const open = expandedId === app.id;
@@ -325,6 +373,8 @@ export function DashboardClient({
               })}
             </tbody>
           </table>
+        </div>
+          )}
         </div>
       )}
     </div>
