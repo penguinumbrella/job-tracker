@@ -2,34 +2,45 @@
 
 Web app that reads Gmail for **real application / hiring-stage emails**, extracts company + status, and syncs a Google Sheet.
 
-## What counts as an application
+## Classification
 
-Kept:
-- “We received your application…”, thank-you-for-applying, under review, interview, assessment, offer, rejection
+1. **Rules first** (`src/lib/classify/rules.ts`) — reject alerts/bots; detect applied/interview/etc.; regex company/role.
+2. **Optional LLM** — only runs when rules already think it’s an application (saves quota).
+   - Prefer **Gemini free tier** via `GEMINI_API_KEY` ([Google AI Studio](https://aistudio.google.com/apikey))
+   - Falls back to OpenAI if only `OPENAI_API_KEY` is set
+   - No key → rules-only
 
-Rejected:
-- Job alerts / digests / “new openings hiring”
-- Apply bots / finish-applying reminders
-- Emails with no extractable company name
+## Sync modes (dashboard)
 
-Company names are parsed from body phrases like `We have received your application at [Company]` and from the From display name when needed.
+| Button | Lookback | Max candidates | LLM reclassify skips |
+|--------|----------|----------------|----------------------|
+| **Test sync (14 days)** | 14d | ~100 (2×50) | no — cheapest for trying Gemini |
+| Sync new mail | history / recent | small | no |
+| Full sync (90 days) | 90d | ~600 | yes |
+
+Body sent to the LLM is capped (~1200 chars); output capped at 256 tokens.
 
 ## Setup
 
 ```bash
 npm install
 npx prisma migrate dev --name init
-cp .env.example .env   # fill Google OAuth (+ optional OPENAI_API_KEY)
+cp .env.example .env
+```
+
+Fill in:
+- Google OAuth (`AUTH_GOOGLE_*`) — enable **Gmail**, **Sheets**, **Drive** APIs; add yourself as OAuth **test user**
+- `GEMINI_API_KEY` from [AI Studio](https://aistudio.google.com/apikey)
+- Optional: `GEMINI_MODEL=gemini-2.0-flash` (or `gemini-2.0-flash-lite` / `gemini-2.5-flash-lite` if your project has them)
+
+```bash
 npm run dev
 ```
 
-Enable on the same GCP project: **Gmail API**, **Google Sheets API**, **Google Drive API**.  
-Add yourself as an OAuth **test user** while the consent screen is in Testing.
+Then: **Test sync (14 days)** first. Only run Full sync after you’re happy with quality.
 
 ## Scripts
 
-- `npm run dev` — local server
-- `npm run test:classify` — rules unit checks
-- `npm run build` — production build
-
-See `.env.example` for Auth, OpenAI, cron, and Pub/Sub variables.
+- `npm run dev`
+- `npm run test:classify`
+- `npm run build`

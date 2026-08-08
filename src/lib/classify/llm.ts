@@ -1,8 +1,12 @@
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import OpenAI from "openai";
 import { z } from "zod";
 import type { ParsedGmailMessage } from "@/lib/gmail";
 import type { RuleClassification } from "@/lib/classify/rules";
 import { JOB_STATUSES, type JobStatus } from "@/lib/types";
+
+/** Keep prompts short + body capped to save free-tier tokens. */
+const BODY_EXCERPT_CHARS = 1200;
 
 const ExtractionSchema = z.object({
   isJobRelated: z.boolean(),
@@ -24,6 +28,22 @@ export type ClassificationResult = {
   reason: string;
   source: "rules" | "llm" | "hybrid";
 };
+
+const SYSTEM_PROMPT = `Classify one inbox email for a personal job APPLICATION tracker. Reply with JSON only.
+
+isJobRelated=true only if the recipient already applied, or this is a later stage update (review/assessment invite/scheduled interview/offer/rejection/withdrawal).
+isJobRelated=false for alerts, digests, new openings, apply-bots, cold outreach, newsletters.
+
+status:
+- applied: submission/received confirmation (even if it mentions a future "interview process")
+- under_review: actively reviewing their application
+- assessment: they must take a test/Hackerrank/take-home now
+- interview: ONLY invited/scheduled/confirmed interview — not the word "interview" alone
+- offer|rejected|withdrawn|unknown
+
+Extract company (never "Unknown"; null if unclear), role/title (null if absent), appliedDate ISO or null, confidence, short reason.
+
+Keys: isJobRelated, company, role, status, appliedDate, confidence, reason`;
 
 function parseAppliedDate(value: string | null): Date | null {
   if (!value) return null;
@@ -49,7 +69,6 @@ function fromRules(
   };
 }
 
-/** Guardrail: LLMs often mark "thank you for applying… interview process" as interview. */
 function reconcileStatus(
   llmStatus: JobStatus,
   rules: RuleClassification,
@@ -71,7 +90,6 @@ function reconcileStatus(
     return "applied";
   }
 
-  // Prefer strong rules evidence for applied confirmations
   if (
     rules.status === "applied" &&
     rules.confidence !== "low" &&
@@ -84,106 +102,143 @@ function reconcileStatus(
   return llmStatus;
 }
 
+function stripJsonFence(text: string): string {
+  const trimmed = text.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)```$/i);
+  return fenced?.[1]?.trim() ?? trimmed;
+}
+
+function buildUserPayload(message: ParsedGmailMessage, rules: RuleClassification) {
+  return JSON.stringify({
+    from: message.fromAddress,
+    subject: message.subject,
+    date: message.receivedAt.toISOString(),
+    snippet: message.snippet?.slice(0, 280) ?? "",
+    bodyExcerpt: message.bodyExcerpt.slice(0, BODY_EXCERPT_CHARS),
+    rulesHint: {
+      status: rules.status,
+      companyGuess: rules.companyGuess,
+      roleGuess: rules.roleGuess,
+    },
+  });
+}
+
+function toResult(
+  data: z.infer<typeof ExtractionSchema>,
+  message: ParsedGmailMessage,
+  rules: RuleClassification,
+  haystack: string
+): ClassificationResult {
+  const company =
+    (data.company && data.company.trim()) || rules.companyGuess || null;
+  const role = (data.role && data.role.trim()) || rules.roleGuess || null;
+  const status = reconcileStatus(data.status, rules, haystack);
+
+  return {
+    isJobRelated: data.isJobRelated,
+    company: company && !/^unknown$/i.test(company) ? company : null,
+    role,
+    status,
+    appliedAt:
+      parseAppliedDate(data.appliedDate) ??
+      (status === "applied" ? message.receivedAt : null),
+    confidence: data.confidence,
+    reason: data.reason,
+    source: "hybrid",
+  };
+}
+
+/** Prefer Gemini free tier; fall back to OpenAI if only that key exists. */
+function resolveProvider(): "gemini" | "openai" | null {
+  if (process.env.GEMINI_API_KEY?.trim()) return "gemini";
+  if (process.env.OPENAI_API_KEY?.trim()) return "openai";
+  return null;
+}
+
+/**
+ * Spend LLM tokens only when rules already think this is an application.
+ * Rejected noise / non-jobs stay rules-only (saves free-tier quota).
+ */
+function shouldCallLlm(rules: RuleClassification): boolean {
+  if (rules.noiseKind !== "none") return false;
+  return rules.isLikelyJob;
+}
+
+async function classifyWithGemini(
+  message: ParsedGmailMessage,
+  rules: RuleClassification
+): Promise<string> {
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+  const modelName = process.env.GEMINI_MODEL?.trim() || "gemini-2.0-flash";
+  const model = genAI.getGenerativeModel({
+    model: modelName,
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: "application/json",
+      maxOutputTokens: 256,
+    },
+  });
+
+  const result = await model.generateContent([
+    { text: SYSTEM_PROMPT },
+    { text: buildUserPayload(message, rules) },
+  ]);
+
+  return result.response.text();
+}
+
+async function classifyWithOpenAI(
+  message: ParsedGmailMessage,
+  rules: RuleClassification
+): Promise<string> {
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+  const completion = await openai.chat.completions.create({
+    model: process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini",
+    temperature: 0,
+    max_tokens: 256,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: buildUserPayload(message, rules) },
+    ],
+  });
+  return completion.choices[0]?.message?.content ?? "{}";
+}
+
 export async function classifyEmail(
   message: ParsedGmailMessage,
   rules: RuleClassification
 ): Promise<ClassificationResult> {
-  if (rules.noiseKind !== "none") {
+  if (!shouldCallLlm(rules)) {
     return fromRules(message, rules);
   }
 
-  const apiKey = process.env.OPENAI_API_KEY;
+  const provider = resolveProvider();
+  if (!provider) {
+    return fromRules(message, rules);
+  }
+
   const haystack = `${message.subject}\n${message.snippet}\n${message.bodyExcerpt}`;
 
-  if (!apiKey) {
-    return fromRules(message, rules);
-  }
-
-  if (!rules.isLikelyJob && rules.confidence === "high") {
-    return fromRules(message, rules);
-  }
-
   try {
-    const openai = new OpenAI({ apiKey });
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content: `You classify inbox emails for a personal job APPLICATION tracker.
+    const rawText =
+      provider === "gemini"
+        ? await classifyWithGemini(message, rules)
+        : await classifyWithOpenAI(message, rules);
 
-isJobRelated = true ONLY if the email is about an application the recipient already submitted, OR a later stage update for that same application (review, assessment invite, scheduled interview, offer, rejection, withdrawal).
-
-isJobRelated = false for job alerts, digests, "new openings", apply-now bots, cold recruiter spam, newsletters.
-
-STATUS RULES (important):
-- applied: confirmation that they submitted / application was received. Even if the email mentions "interview process" or "if selected for an interview", status is still applied.
-- under_review: explicitly reviewing their application now.
-- assessment: they are asked to complete a test / Hackerrank / take-home NOW.
-- interview: ONLY if an interview is invited, scheduled, or confirmed. Mere mention of the word "interview" is NOT enough.
-- offer / rejected / withdrawn: clear outcome language.
-- unknown: unclear stage.
-
-FIELD EXTRACTION:
-- company: employer name from body ("application at/to/with COMPANY") or From display name. Never "Unknown"; use null if unclear.
-- role: the job title (e.g. "Software Engineer Intern", "Analyst"). Look in subject and body for "application for ROLE", "ROLE role/position", "Position: ROLE". null if absent.
-- appliedDate: ISO date when this email confirms submission; else null.
-- confidence: high|medium|low
-- reason: short
-
-Return JSON keys: isJobRelated, company, role, status, appliedDate, confidence, reason.`,
-        },
-        {
-          role: "user",
-          content: JSON.stringify({
-            from: message.fromAddress,
-            subject: message.subject,
-            date: message.receivedAt.toISOString(),
-            snippet: message.snippet,
-            bodyExcerpt: message.bodyExcerpt.slice(0, 3500),
-            rulesHint: {
-              isLikelyJob: rules.isLikelyJob,
-              status: rules.status,
-              companyGuess: rules.companyGuess,
-              roleGuess: rules.roleGuess,
-              reason: rules.reason,
-            },
-          }),
-        },
-      ],
-    });
-
-    const raw = completion.choices[0]?.message?.content ?? "{}";
-    const parsed = ExtractionSchema.safeParse(JSON.parse(raw));
+    const parsed = ExtractionSchema.safeParse(
+      JSON.parse(stripJsonFence(rawText))
+    );
     if (!parsed.success) {
-      return fromRules(message, rules, "llm-parse-failed");
+      return fromRules(message, rules, `${provider}-parse-failed`);
     }
-
-    const data = parsed.data;
-    const company =
-      (data.company && data.company.trim()) ||
-      rules.companyGuess ||
-      null;
-    const role =
-      (data.role && data.role.trim()) || rules.roleGuess || null;
-    const status = reconcileStatus(data.status, rules, haystack);
-
-    return {
-      isJobRelated: data.isJobRelated,
-      company: company && !/^unknown$/i.test(company) ? company : null,
-      role,
-      status,
-      appliedAt:
-        parseAppliedDate(data.appliedDate) ??
-        (status === "applied" ? message.receivedAt : null),
-      confidence: data.confidence,
-      reason: data.reason,
-      source: "hybrid",
-    };
+    return toResult(parsed.data, message, rules, haystack);
   } catch (err) {
-    console.error("LLM classification failed", err);
-    return fromRules(message, rules, "llm-error");
+    console.error(`${provider} classification failed`, err);
+    return fromRules(message, rules, `${provider}-error`);
   }
+}
+
+export function getActiveLlmProvider(): "gemini" | "openai" | "none" {
+  return resolveProvider() ?? "none";
 }

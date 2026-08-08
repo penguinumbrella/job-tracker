@@ -35,6 +35,12 @@ type DashboardPayload = {
   gmailWatchExpiry: string | null;
 };
 
+type LlmStatus = {
+  llmProvider: "gemini" | "openai" | "none";
+  geminiModel: string | null;
+  tips: string;
+};
+
 function statusTone(status: string): string {
   switch (status) {
     case "offer":
@@ -65,6 +71,7 @@ export function DashboardClient({
   userEmail?: string | null;
 }) {
   const [data, setData] = useState<DashboardPayload | null>(null);
+  const [llmStatus, setLlmStatus] = useState<LlmStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
@@ -72,9 +79,13 @@ export function DashboardClient({
   const [statusFilter, setStatusFilter] = useState<"all" | JobStatus>("all");
 
   const load = useCallback(async () => {
-    const res = await fetch("/api/applications");
-    if (!res.ok) throw new Error("Failed to load applications");
-    setData((await res.json()) as DashboardPayload);
+    const [appsRes, llmRes] = await Promise.all([
+      fetch("/api/applications"),
+      fetch("/api/llm-status"),
+    ]);
+    if (!appsRes.ok) throw new Error("Failed to load applications");
+    setData((await appsRes.json()) as DashboardPayload);
+    if (llmRes.ok) setLlmStatus((await llmRes.json()) as LlmStatus);
   }, []);
 
   useEffect(() => {
@@ -83,7 +94,7 @@ export function DashboardClient({
     );
   }, [load]);
 
-  function runSync(mode: "full" | "incremental") {
+  function runSync(mode: "full" | "incremental" | "test") {
     setSyncMessage(null);
     setError(null);
     startTransition(async () => {
@@ -96,7 +107,7 @@ export function DashboardClient({
         const json = await res.json();
         if (!res.ok) throw new Error(json.error ?? "Sync failed");
         setSyncMessage(
-          `Scanned ${json.scanned}, created ${json.createdApplications}, updated ${json.updatedApplications}, skipped ${json.skipped}` +
+          `[${json.mode}/${json.llmProvider}] Scanned ${json.scanned}, created ${json.createdApplications}, updated ${json.updatedApplications}, skipped ${json.skipped}` +
             (json.errors?.length ? ` (${json.errors.length} warnings)` : "")
         );
         await load();
@@ -149,7 +160,13 @@ export function DashboardClient({
             {data?.lastSyncedAt
               ? ` · Last sync ${formatDistanceToNow(new Date(data.lastSyncedAt), { addSuffix: true })}`
               : " · Not synced yet"}
+            {llmStatus
+              ? ` · LLM: ${llmStatus.llmProvider}${llmStatus.geminiModel ? ` (${llmStatus.geminiModel})` : ""}`
+              : ""}
           </p>
+          {llmStatus?.tips && (
+            <p className="mt-1 max-w-xl text-xs text-stone-500">{llmStatus.tips}</p>
+          )}
         </div>
         <div className="flex flex-wrap gap-2">
           {data?.sheetUrl && (
@@ -173,10 +190,18 @@ export function DashboardClient({
           <button
             type="button"
             disabled={isPending}
-            onClick={() => runSync("full")}
+            onClick={() => runSync("test")}
             className="rounded-md bg-teal-800 px-3 py-2 text-sm text-teal-50 hover:bg-teal-900 disabled:opacity-50"
           >
-            {isPending ? "Syncing…" : "Full sync (90 days)"}
+            {isPending ? "Syncing…" : "Test sync (14 days)"}
+          </button>
+          <button
+            type="button"
+            disabled={isPending}
+            onClick={() => runSync("full")}
+            className="rounded-md border border-stone-300 bg-white px-3 py-2 text-sm text-stone-800 hover:bg-stone-50 disabled:opacity-50"
+          >
+            Full sync (90 days)
           </button>
           <button
             type="button"
@@ -214,10 +239,10 @@ export function DashboardClient({
           <button
             type="button"
             disabled={isPending}
-            onClick={() => runSync("full")}
+            onClick={() => runSync("test")}
             className="mt-6 rounded-md bg-teal-800 px-4 py-2.5 text-sm text-teal-50 hover:bg-teal-900 disabled:opacity-50"
           >
-            {isPending ? "Syncing…" : "Scan Gmail now"}
+            {isPending ? "Syncing…" : "Test sync (14 days)"}
           </button>
         </div>
       ) : (

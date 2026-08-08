@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@auth/prisma-adapter": "^2.11.3",
+    "@google/generative-ai": "^0.24.1",
     "@prisma/client": "^6.19.3",
     "date-fns": "^4.4.0",
     "googleapis": "^174.0.1",
