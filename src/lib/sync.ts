@@ -7,7 +7,11 @@ import {
   startGmailWatch,
 } from "@/lib/gmail";
 import { classifyWithRules } from "@/lib/classify/rules";
-import { classifyEmail } from "@/lib/classify/llm";
+import {
+  classifyEmail,
+  getLlmSyncStats,
+  resetLlmBudget,
+} from "@/lib/classify/llm";
 import {
   findMatchingApplication,
   refreshApplicationStatus,
@@ -25,6 +29,9 @@ export type SyncSummary = {
   skipped: number;
   sheetUrl: string | null;
   errors: string[];
+  llmCalls?: number;
+  llmRateLimitedFallbacks?: number;
+  llmBudgetExhaustedFallbacks?: number;
 };
 
 function formatGoogleApiError(err: unknown): string {
@@ -198,6 +205,8 @@ export async function syncUserMailbox(
     errors: [],
   };
 
+  resetLlmBudget();
+
   if (options.reclassifySkipped) {
     const deleted = await prisma.emailEvent.deleteMany({
       where: { userId, isJobRelated: false },
@@ -259,6 +268,21 @@ export async function syncUserMailbox(
     );
   }
 
+  const llm = getLlmSyncStats();
+  summary.llmCalls = llm.calls;
+  summary.llmRateLimitedFallbacks = llm.rateLimitedFallbacks;
+  summary.llmBudgetExhaustedFallbacks = llm.budgetExhaustedFallbacks;
+  if (llm.rateLimitedFallbacks > 0) {
+    summary.errors.push(
+      `Gemini rate-limited ${llm.rateLimitedFallbacks} time(s); fell back to rules for the rest of this sync`
+    );
+  }
+  if (llm.budgetExhaustedFallbacks > 0) {
+    summary.errors.push(
+      `LLM budget (${process.env.LLM_MAX_CALLS_PER_SYNC ?? 12}/sync) reached; ${llm.budgetExhaustedFallbacks} email(s) used rules only`
+    );
+  }
+
   return summary;
 }
 
@@ -278,6 +302,8 @@ export async function syncFromHistory(userId: string): Promise<SyncSummary> {
       : null,
     errors: [],
   };
+
+  resetLlmBudget();
 
   const { messageIds, newHistoryId } = await listHistoryMessageIds(
     userId,
@@ -304,6 +330,11 @@ export async function syncFromHistory(userId: string): Promise<SyncSummary> {
       lastSyncedAt: new Date(),
     },
   });
+
+  const llm = getLlmSyncStats();
+  summary.llmCalls = llm.calls;
+  summary.llmRateLimitedFallbacks = llm.rateLimitedFallbacks;
+  summary.llmBudgetExhaustedFallbacks = llm.budgetExhaustedFallbacks;
 
   return summary;
 }

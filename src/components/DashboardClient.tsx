@@ -108,6 +108,7 @@ export function DashboardClient({
         if (!res.ok) throw new Error(json.error ?? "Sync failed");
         setSyncMessage(
           `[${json.mode}/${json.llmProvider}] Scanned ${json.scanned}, created ${json.createdApplications}, updated ${json.updatedApplications}, skipped ${json.skipped}` +
+            (json.llmCalls != null ? `, llm ${json.llmCalls}` : "") +
             (json.errors?.length ? ` (${json.errors.length} warnings)` : "")
         );
         await load();
@@ -143,7 +144,9 @@ export function DashboardClient({
         setSyncMessage(
           `Cleared ${json.deletedEvents} email(s) + ${json.deletedApplications} app(s). ` +
             (s
-              ? `Resync [${json.mode}/${json.llmProvider}]: scanned ${s.scanned}, created ${s.createdApplications}, updated ${s.updatedApplications}, skipped ${s.skipped}`
+              ? `Resync [${json.mode}/${json.llmProvider}]: scanned ${s.scanned}, created ${s.createdApplications}, updated ${s.updatedApplications}, skipped ${s.skipped}` +
+                (s.llmCalls != null ? `, llm ${s.llmCalls}` : "") +
+                (s.errors?.length ? ` (${s.errors.length} warnings)` : "")
               : "No resync.")
         );
         await load();

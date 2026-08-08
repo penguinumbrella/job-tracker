@@ -8,6 +8,14 @@ import { JOB_STATUSES, type JobStatus } from "@/lib/types";
 /** Keep prompts short + body capped to save free-tier tokens. */
 const BODY_EXCERPT_CHARS = 1200;
 
+/**
+ * Gemini free tier is often ~5–15 RPM. Space calls out and cap per sync.
+ * Override with LLM_MIN_INTERVAL_MS / LLM_MAX_CALLS_PER_SYNC in .env
+ */
+const MIN_INTERVAL_MS = Number(process.env.LLM_MIN_INTERVAL_MS ?? 4500);
+const MAX_CALLS_PER_SYNC = Number(process.env.LLM_MAX_CALLS_PER_SYNC ?? 12);
+const MAX_RETRIES = 3;
+
 const ExtractionSchema = z.object({
   isJobRelated: z.boolean(),
   company: z.string().nullable(),
@@ -28,6 +36,33 @@ export type ClassificationResult = {
   reason: string;
   source: "rules" | "llm" | "hybrid";
 };
+
+export type LlmSyncStats = {
+  calls: number;
+  rateLimitedFallbacks: number;
+  budgetExhaustedFallbacks: number;
+};
+
+let lastLlmCallAt = 0;
+let llmCallsThisSync = 0;
+let rateLimitedFallbacks = 0;
+let budgetExhaustedFallbacks = 0;
+
+/** Call at the start of each mailbox sync. */
+export function resetLlmBudget() {
+  llmCallsThisSync = 0;
+  rateLimitedFallbacks = 0;
+  budgetExhaustedFallbacks = 0;
+  // Don't reset lastLlmCallAt — still respect spacing across syncs in the same process
+}
+
+export function getLlmSyncStats(): LlmSyncStats {
+  return {
+    calls: llmCallsThisSync,
+    rateLimitedFallbacks,
+    budgetExhaustedFallbacks,
+  };
+}
 
 const SYSTEM_PROMPT = `Classify one inbox email for a personal job APPLICATION tracker. Reply with JSON only.
 
@@ -148,20 +183,56 @@ function toResult(
   };
 }
 
-/** Prefer Gemini free tier; fall back to OpenAI if only that key exists. */
 function resolveProvider(): "gemini" | "openai" | null {
   if (process.env.GEMINI_API_KEY?.trim()) return "gemini";
   if (process.env.OPENAI_API_KEY?.trim()) return "openai";
   return null;
 }
 
-/**
- * Spend LLM tokens only when rules already think this is an application.
- * Rejected noise / non-jobs stay rules-only (saves free-tier quota).
- */
 function shouldCallLlm(rules: RuleClassification): boolean {
   if (rules.noiseKind !== "none") return false;
   return rules.isLikelyJob;
+}
+
+function isRateLimitError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  const status =
+    (err as { status?: number; statusCode?: number; code?: number })?.status ??
+    (err as { statusCode?: number })?.statusCode ??
+    (err as { code?: number })?.code;
+  return (
+    status === 429 ||
+    /too many requests|resource.exhausted|rate.?limit|quota/i.test(msg)
+  );
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function throttleLlmCalls() {
+  const wait = lastLlmCallAt + MIN_INTERVAL_MS - Date.now();
+  if (wait > 0) await sleep(wait);
+  lastLlmCallAt = Date.now();
+}
+
+async function withRetries<T>(fn: () => Promise<T>): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      await throttleLlmCalls();
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isRateLimitError(err) || attempt === MAX_RETRIES - 1) throw err;
+      // Free tier: back off hard (15s, 30s, …)
+      const backoff = 15000 * (attempt + 1);
+      console.warn(`LLM rate limited; retrying in ${backoff}ms`);
+      await sleep(backoff);
+      lastLlmCallAt = Date.now();
+    }
+  }
+  throw lastErr;
 }
 
 async function classifyWithGemini(
@@ -218,13 +289,20 @@ export async function classifyEmail(
     return fromRules(message, rules);
   }
 
+  if (llmCallsThisSync >= MAX_CALLS_PER_SYNC) {
+    budgetExhaustedFallbacks += 1;
+    return fromRules(message, rules, "llm-budget-exhausted");
+  }
+
   const haystack = `${message.subject}\n${message.snippet}\n${message.bodyExcerpt}`;
 
   try {
-    const rawText =
+    llmCallsThisSync += 1;
+    const rawText = await withRetries(async () =>
       provider === "gemini"
-        ? await classifyWithGemini(message, rules)
-        : await classifyWithOpenAI(message, rules);
+        ? classifyWithGemini(message, rules)
+        : classifyWithOpenAI(message, rules)
+    );
 
     const parsed = ExtractionSchema.safeParse(
       JSON.parse(stripJsonFence(rawText))
@@ -235,6 +313,12 @@ export async function classifyEmail(
     return toResult(parsed.data, message, rules, haystack);
   } catch (err) {
     console.error(`${provider} classification failed`, err);
+    if (isRateLimitError(err)) {
+      rateLimitedFallbacks += 1;
+      // Stop burning the free tier for the rest of this sync
+      llmCallsThisSync = MAX_CALLS_PER_SYNC;
+      return fromRules(message, rules, `${provider}-rate-limited`);
+    }
     return fromRules(message, rules, `${provider}-error`);
   }
 }
